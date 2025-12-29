@@ -1,0 +1,30 @@
+- id: BF-001
+  name: Brute Force Authentication Attempt
+  description: Detects multiple failed login attempts from same IP
+  severity: high
+  enabled: true
+  type: brute_force
+
+  log_source:
+    event_type: auth_failure
+
+  threshold:
+    count: 5
+    timeframe_minutes: 5
+
+  group_by:
+    - ip
+
+  response:
+    alert: true
+    quarantine: false
+
+- id: bf-002
+  name: Successful Login After Multiple Failures
+  description: Detects a successful login after multiple failed attempts from the same IP
+  severity: critical
+  condition: 'log["event_type"] == "authentication_success" and any(
+    prev_log["event_type"] == "authentication_failure" and 
+    prev_log["ip"] == log["ip"] 
+    for prev_log in log.get("previous_logs", [])[:10]
+  )'
