@@ -3,8 +3,20 @@ Log schema and normalization for SOC Log Analyzer.
 Defines the common log entry structure and normalization functions.
 """
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, TypedDict
 import re
+
+class LogEntry(TypedDict):
+    """Type definition for normalized log entries."""
+    timestamp: Optional[datetime]
+    source: Optional[str]
+    host: Optional[str]
+    user: Optional[str]
+    ip: Optional[str]
+    event_type: Optional[str]
+    status: Optional[str]
+    severity: Optional[str]
+    raw_log: Optional[str]
 
 # Common schema for all normalized events
 NORMALIZED_SCHEMA = {

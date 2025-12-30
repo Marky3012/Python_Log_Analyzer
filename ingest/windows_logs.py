@@ -4,10 +4,19 @@ Handles reading and parsing Windows Event Logs in EVTX and XML formats.
 """
 import os
 import sys
+import re
+import time
 import platform
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Generator, Union
+
+# Try to import python-evtx
+try:
+    from Evtx.Evtx import Evtx
+    EVTX_AVAILABLE = True
+except ImportError:
+    EVTX_AVAILABLE = False
 import xml.dom.minidom
 import xmltodict
 import pytz
@@ -25,8 +34,8 @@ class WindowsEventLogs:
     
     # Default Windows Event Log paths
     DEFAULT_PATHS = [
-        r"C:\Windows\System32\winevt\Logs\",
-        r"C:\Windows\System32\config\"
+        r"C:\Windows\System32\winevt\Logs",
+        r"C:\Windows\System32\config"
     ]
     
     # Important Windows Event Log files
@@ -123,9 +132,108 @@ class WindowsEventLogs:
         
         return found_logs
     
+    def _is_valid_evtx(self, file_path: str) -> bool:
+        """
+        Check if a file is a valid EVTX file and can be read.
+        
+        Args:
+            file_path: Path to the EVTX file to validate
+            
+        Returns:
+            bool: True if the file is a valid EVTX file, False otherwise
+        """
+        try:
+            # Check if file exists
+            if not os.path.isfile(file_path):
+                print(f"[!] File not found or not a regular file: {file_path}", file=sys.stderr)
+                return False
+                
+            # Check file size
+            try:
+                file_size = os.path.getsize(file_path)
+                if file_size < 4096:  # Minimum size for a valid EVTX file
+                    print(f"[!] File is too small to be a valid EVTX: {file_path} ({file_size} bytes)", 
+                          file=sys.stderr)
+                    return False
+            except (OSError, IOError) as e:
+                print(f"[!] Error getting file size for {file_path}: {str(e)}", file=sys.stderr)
+                return False
+                
+            # Check file permissions
+            if not os.access(file_path, os.R_OK):
+                print(f"[!] Insufficient permissions to read file: {file_path}", file=sys.stderr)
+                if platform.system() == 'Windows':
+                    print("    Try running the script as Administrator", file=sys.stderr)
+                return False
+                
+            # Check EVTX header
+            try:
+                with open(file_path, 'rb') as f:
+                    header = f.read(8)
+                    if header != b'ElfFile\x00':
+                        print(f"[!] Invalid EVTX header in {file_path}", file=sys.stderr)
+                        return False
+                    
+                    # Read a bit more to verify the file isn't corrupted
+                    f.seek(0, 2)  # Seek to end of file
+                    file_size = f.tell()
+                    if file_size < 128:  # EVTX files have at least 128-byte header
+                        print(f"[!] File is too small to be a valid EVTX: {file_path}", file=sys.stderr)
+                        return False
+                        
+            except (IOError, OSError) as e:
+                print(f"[!] Error reading file {file_path}: {str(e)}", file=sys.stderr)
+                if 'Permission denied' in str(e) and platform.system() == 'Windows':
+                    print("    Try running the script as Administrator", file=sys.stderr)
+                return False
+                
+            return True
+            
+        except Exception as e:
+            print(f"[!] Unexpected error validating EVTX file {file_path}: {str(e)}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
+            return False
+    
+    def _get_evtx_record_count(self, file_path: str, max_retries: int = 3) -> int:
+        """
+        Safely get the number of records in an EVTX file with retry logic.
+        
+        Args:
+            file_path: Path to the EVTX file
+            max_retries: Maximum number of retry attempts
+            
+        Returns:
+            Number of records in the EVTX file, or 0 if it can't be determined
+        """
+        if not EVTX_AVAILABLE or not file_path:
+            return 0
+            
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                with Evtx(file_path) as evtx:
+                    # Try to get an accurate count, but limit to 1M records to avoid excessive memory usage
+                    count = 0
+                    for _ in evtx.records():
+                        count += 1
+                        if count >= 1_000_000:  # Safety limit
+                            print(f"[!] Warning: File has more than 1,000,000 records, using estimate")
+                            break
+                    return count
+            except Exception as e:
+                last_error = e
+                if attempt < max_retries - 1:  # Don't sleep on the last attempt
+                    time.sleep(0.5 * (attempt + 1))  # Exponential backoff
+        
+        print(f"[!] Warning: Could not get record count for {file_path} after {max_retries} attempts")
+        if last_error:
+            print(f"     Last error: {str(last_error)}")
+        return 0  # Return 0 to indicate we couldn't determine the count
+    
     def parse_evtx_file(self, file_path: str) -> Generator[Dict[str, Any], None, None]:
         """
-        Parse an EVTX file and yield normalized events.
+        Parse an EVTX file and yield normalized events with robust error handling.
         
         Args:
             file_path: Path to the EVTX file
@@ -133,59 +241,140 @@ class WindowsEventLogs:
         Yields:
             Normalized event dictionaries
         """
-        try:
-            import Evtx.Evtx as evtx
-            from bs4 import BeautifulSoup
-            
-            with evtx.Evtx(file_path) as log:
-                for record in log.records():
-                    try:
-                        # Parse XML content
-                        xml_content = record.xml()
-                        soup = BeautifulSoup(xml_content, 'xml')
-                        
-                        # Extract basic event information
-                        system = soup.find('System')
-                        if not system:
-                            continue
-                            
-                        event_data = {
-                            'timestamp': self._parse_windows_timestamp(system.find('TimeCreated').get('SystemTime')),
-                            'event_id': int(system.find('EventID').text),
-                            'channel': system.find('Channel').text if system.find('Channel') else None,
-                            'computer': system.find('Computer').text if system.find('Computer') else None,
-                            'level': int(system.find('Level').text) if system.find('Level') else 0,
-                        }
-                        
-                        # Extract user information if available
-                        security = system.find('Security')
-                        if security and 'UserID' in security.attrs:
-                            event_data['user'] = security['UserID']
-                        
-                        # Extract event data
-                        data = {}
-                        event_data_node = soup.find('EventData')
-                        if event_data_node:
-                            for data_item in event_data_node.find_all('Data'):
-                                name = data_item.get('Name', f'Data{len(data)}')
-                                data[name] = data_item.text
-                        
-                        # Map to SOC schema
-                        normalized = self._normalize_windows_event(event_data, data, file_path)
-                        if normalized:
-                            yield normalized
-                            
-                    except Exception as e:
-                        print(f"[!] Error parsing event: {str(e)}", file=sys.stderr)
-                        continue
-                        
-        except ImportError:
+        if not EVTX_AVAILABLE:
             print("[!] python-evtx module not found. Install with: pip install python-evtx", 
                   file=sys.stderr)
-            return []
+            return
+            
+        if not self._is_valid_evtx(file_path):
+            return
+
+        # Get record count with retry logic
+        max_retries = 3
+        record_count = 0
+        for attempt in range(max_retries):
+            try:
+                record_count = self._get_evtx_record_count(file_path)
+                break
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[!] Failed to get record count after {max_retries} attempts: {str(e)}")
+                    return
+                time.sleep(1)  # Wait before retry
+        
+        if record_count > 0:
+            print(f"[+] Found {record_count} records in {os.path.basename(file_path)}")
+        else:
+            print(f"[!] No records found in {os.path.basename(file_path)} or could not read file")
+            return
+
+        success_count = 0
+        error_count = 0
+        max_errors = min(100, record_count // 10)  # Allow up to 10% errors or 100, whichever is smaller
+        
+        try:
+            # Open the EVTX file for processing
+            with Evtx(file_path) as evtx:
+                for i, record in enumerate(evtx.records(), 1):
+                    # If we hit too many errors, bail out
+                    if error_count > max_errors and max_errors > 0:
+                        print(f"[!] Too many errors ({error_count} out of {i} records). Stopping processing of {file_path}")
+                        break
+                        
+                    try:
+                        # Parse the XML content with error handling for malformed XML
+                        try:
+                            xml_data = record.xml()
+                            root = ET.fromstring(xml_data)
+                        except ET.ParseError as e:
+                            print(f"[!] XML parsing error in record {i}: {str(e)}")
+                            error_count += 1
+                            continue
+                            
+                        # Extract basic event data with robust error handling
+                        ns = {'evt': 'http://schemas.microsoft.com/win/2004/08/events/event'}
+                        event_data = {}
+                        
+                        try:
+                            event_data = {
+                                'timestamp': self._safe_xml_find(root, './/evt:TimeCreated', ns, 'SystemTime'),
+                                'event_id': int(self._safe_xml_find(root, './/evt:EventID', ns, 'text') or 0),
+                                'level': int(self._safe_xml_find(root, './/evt:Level', ns, 'text') or 0),
+                                'provider': self._safe_xml_find(root, './/evt:Provider', ns, 'Name'),
+                                'computer': self._safe_xml_find(root, './/evt:Computer', ns, 'text'),
+                                'channel': self._safe_xml_find(root, './/evt:Channel', ns, 'text'),
+                            }
+                        except (AttributeError, ValueError, TypeError) as e:
+                            print(f"[!] Error extracting fields from record {i}: {str(e)}")
+                            error_count += 1
+                            continue
+                        
+                        # Extract event data with error handling
+                        data = {}
+                        try:
+                            data_items = root.findall('.//evt:EventData/evt:Data', ns) or []
+                            for idx, data_item in enumerate(data_items):
+                                try:
+                                    name = data_item.get('Name', f'Data{idx}')
+                                    data[name] = data_item.text if data_item.text else ''
+                                except Exception as e:
+                                    print(f"[!] Warning: Error processing data item {idx} in record {i}: {str(e)}")
+                        except Exception as e:
+                            print(f"[!] Warning: Error extracting event data from record {i}: {str(e)}")
+                        
+                        # Map to SOC schema with error handling
+                        try:
+                            normalized = self._normalize_windows_event(event_data, data, file_path) 
+                            if normalized:
+                                success_count += 1
+                                # Show progress every 1000 records
+                                if success_count % 1000 == 0:
+                                    print(f"[+] Processed {success_count}/{record_count} records...")
+                                yield normalized
+                        except Exception as e:
+                            print(f"[!] Error normalizing event {i}: {str(e)}")
+                            error_count += 1
+                            
+                    except Exception as e:
+                        error_count += 1
+                        print(f"[!] Error parsing record {i} in {file_path}: {str(e)}")
+                        # For debugging specific records, uncomment the following:
+                        # if i == 1714:  # The record that was previously failing
+                        #     print(f"[DEBUG] Problematic record {i} offset: {record.offset()}")
+                        continue
+                
+                # Print final statistics
+                processed_count = success_count + error_count
+                print(f"[+] Processed {processed_count} records from {os.path.basename(file_path)}:")
+                print(f"    - Success: {success_count}")
+                print(f"    - Errors: {error_count}")
+                if processed_count > 0:
+                    print(f"    - Success rate: {(success_count/processed_count)*100:.1f}%")
+                
+                if success_count == 0 and error_count > 0:
+                    print(f"[!] Warning: No valid records found in {os.path.basename(file_path)}")
+                    
+        except PermissionError as e:
+            print(f"[!] Permission denied when accessing {file_path}. Try running as administrator.", file=sys.stderr)
+            if platform.system() == 'Windows':
+                print("    Try running the command prompt as Administrator and then run this script.")
         except Exception as e:
-            print(f"[!] Error reading EVTX file: {str(e)}", file=sys.stderr)
-            return []
+            print(f"[!] Critical error processing EVTX file {file_path}: {str(e)}", file=sys.stderr)
+            if hasattr(e, '__traceback__'):
+                import traceback
+                print(f"[!] Error details: {traceback.format_exc()}", file=sys.stderr)
+    
+    def _safe_xml_find(self, root, xpath, namespaces, attr=None):
+        """Safely find and extract data from XML with error handling."""
+        try:
+            element = root.find(xpath, namespaces)
+            if element is None:
+                return None
+            if attr == 'text':
+                return element.text
+            return element.get(attr) if attr else element
+        except Exception:
+            return None
     
     def _parse_windows_timestamp(self, timestamp_str: str) -> str:
         """Convert Windows timestamp string to ISO format."""

@@ -10,8 +10,14 @@ from rich import box
 class ConsoleOutput:
     """Handles console output with rich formatting."""
     
-    def __init__(self):
+    def __init__(self, verbose: bool = False):
+        """Initialize the console output handler.
+        
+        Args:
+            verbose: Enable verbose output mode
+        """
         self.console = Console()
+        self.verbose = verbose
     
     def print_detections(self, detections: List[Dict[str, Any]]) -> None:
         """Print detection results to the console.
